@@ -1,10 +1,13 @@
 from PySide6.QtWidgets import QApplication, QMainWindow, QLineEdit, QVBoxLayout, QWidget
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QTimer
 from urllib.parse import urlparse
 import sys, spacy, re, difflib, json
 import google.generativeai as genai
 import threading
+from bs4 import BeautifulSoup
+
+global html
 
 nlp = spacy.load("en_core_web_sm")
 genai.configure(api_key="your-api-key")
@@ -13,10 +16,15 @@ model = genai.GenerativeModel("gemini-2.5-flash")
 with open("commands.json") as f:
     commands = json.load(f)["commands"]
 
+def clean_html(html):
+                clean = re.sub(r"<(script|style).*?>.*?</\1>", "", html, flags=re.DOTALL)
+                clean = re.sub(r"<[^>]+>", " ", clean)
+                clean = re.sub(r"\s+", " ", clean).strip()
+
 class Fjord(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Fjord Browser v0.1")
+        self.setWindowTitle("fjord.")
         self.resize(1200, 800)
 
         self.browser = QWebEngineView()
@@ -44,6 +52,7 @@ class Fjord(QMainWindow):
 
         if self.is_valid_url(text):
             self.browser.setUrl(QUrl(text))
+            self.browser.page().toHtml(clean_html)
         elif text.startswith(">"):
             cmd = text[1:].strip()  # remove '>'
             action, value = self.intern(cmd)
@@ -51,12 +60,15 @@ class Fjord(QMainWindow):
             return
         else:
             self.browser.setUrl(QUrl(f"https://duckduckgo.com/?q={text}"))
+            self.browser.page().toHtml(clean_html)
 
     def execute_action(self, action, value):
         if action == "open_url":
             self.browser.setUrl(QUrl(value))
+            self.browser.page().toHtml(clean_html)
         elif action == "search_web":
             self.browser.setUrl(QUrl(f"https://duckduckgo.com/?q={value}"))
+            self.browser.page().toHtml(clean_html)
         elif action == "respond":
             self.browser.setHtml(f"<h2 style='font-family:sans-serif;'>{value}</h2>")
         elif action == "commands":
@@ -77,6 +89,77 @@ class Fjord(QMainWindow):
             threading.Thread(target=store_html, daemon=True).start()
             
             self.browser.page().toHtml(store_html)
+        elif action == "click_element":
+            def find_and_click(html):
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "html.parser")
+                target = value.lower().strip()
+
+                match = None
+                match_id = None
+                match_class = None
+
+                # find the first clickable element that matches text
+                for tag in soup.find_all(["a", "button"]):
+                    text = tag.get_text(strip=True).lower()
+                    href = tag.get("href")
+                    if target in text and (href or tag.name == "button"):
+                        match = tag
+                        match_id = tag.get("id")
+                        match_class = tag.get("class")
+                        break
+
+                if match:
+                    print(f"Found clickable element for '{value}'")
+
+                    # escape properly for JS
+                    safe_target = target.replace("'", "\\'")
+
+                    if match_id:
+                        selector = f"document.getElementById('{match_id}')"
+                    elif match_class:
+                        # use first class if multiple
+                        class_name = match_class[0]
+                        selector = f"document.querySelector('.{class_name}')"
+                    else:
+                        # fallback: try the text-based method as last resort
+                        selector = f"""
+                            Array.from(document.querySelectorAll('a, button')).find(el => 
+                                el.textContent.trim().toLowerCase().includes('{safe_target}')
+                            )
+                        """
+
+                    js = f"""
+                    (function() {{
+                        const found = {selector};
+                        if (found) {{
+                            found.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+                            setTimeout(() => {{
+                                try {{
+                                    found.click();
+                                    found.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
+                                    found.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+                                    found.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
+                                    console.log('Clicked element via id/class for:', '{safe_target}');
+                                }} catch (err) {{
+                                    console.error('Failed to click element:', err);
+                                }}
+                            }}, 300);
+                        }} else {{
+                            console.log('Could not find element by id/class for {safe_target}');
+                        }}
+                    }})();
+                    """
+
+                    self.browser.page().runJavaScript(js)
+                else:
+                    print(f"No clickable matches found for '{value}'")
+
+            QTimer.singleShot(800, lambda: self.browser.page().toHtml(find_and_click))
+
+
+
+
         elif action == "unknown":
             self.browser.setHtml("<p>🤔 I didn’t understand that.</p>")
 
@@ -113,6 +196,10 @@ class Fjord(QMainWindow):
         # --- Summarize / Explain ---
         if "summarize" in lemmas or "explain" in lemmas:
             return ("summarize_page", None)
+        
+        if "click" in lemmas:
+            given = cmd.replace("click", "").strip()
+            return("click_element", given)
 
         # Fallback
         return ("unknown", None)
